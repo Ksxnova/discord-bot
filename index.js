@@ -5,10 +5,12 @@ require("dotenv").config();
 ========================= */
 const http = require("http");
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("sparxo online\n");
-}).listen(PORT, () => console.log("Keep-alive server on", PORT));
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("sparxo online\n");
+  })
+  .listen(PORT, () => console.log("Keep-alive server on", PORT));
 
 /* =========================
    Imports
@@ -76,8 +78,7 @@ const client = new Client({
 const openai = new OpenAI({ apiKey: ENV.OPENAI_KEY });
 
 /* =========================
-   RATE-LIMIT CIRCUIT BREAKER (FIX)
-   When rate limited, STOP calling OpenAI for 3 minutes.
+   RATE-LIMIT CIRCUIT BREAKER
 ========================= */
 let aiBlockedUntil = 0;
 
@@ -116,24 +117,59 @@ function isAdmin(member) {
 function isEducationRelated(text) {
   const t = (text || "").toLowerCase();
   const words = [
-    "math","algebra","geometry","trig","calculus","equation","simplify","factor",
-    "science","physics","chemistry","biology",
-    "english","essay","grammar","literature",
-    "history","geography",
-    "homework","revision","exam","test","worksheet","question",
-    "solve","prove","derive","calculate","evaluate",
+    "math",
+    "algebra",
+    "geometry",
+    "trig",
+    "calculus",
+    "equation",
+    "simplify",
+    "factor",
+    "science",
+    "physics",
+    "chemistry",
+    "biology",
+    "english",
+    "essay",
+    "grammar",
+    "literature",
+    "history",
+    "geography",
+    "homework",
+    "revision",
+    "exam",
+    "test",
+    "worksheet",
+    "question",
+    "solve",
+    "prove",
+    "derive",
+    "calculate",
+    "evaluate",
   ];
-  return words.some(w => t.includes(w));
+  return words.some((w) => t.includes(w));
 }
 
 function needsWeb(text) {
   const t = (text || "").toLowerCase();
   const triggers = [
-    "latest","today","current","news","update","updated","release","version",
-    "price","cost","in stock","availability",
-    "2024","2025","2026",
+    "latest",
+    "today",
+    "current",
+    "news",
+    "update",
+    "updated",
+    "release",
+    "version",
+    "price",
+    "cost",
+    "in stock",
+    "availability",
+    "2024",
+    "2025",
+    "2026",
   ];
-  return triggers.some(w => t.includes(w));
+  return triggers.some((w) => t.includes(w));
 }
 
 /* =========================
@@ -146,7 +182,7 @@ async function webSearch(query) {
     timeout: 15000,
   });
 
-  return (data.organic_results || []).slice(0, 4).map(r => ({
+  return (data.organic_results || []).slice(0, 4).map((r) => ({
     title: r.title,
     link: r.link,
     snippet: String(r.snippet || "").slice(0, 180),
@@ -171,10 +207,15 @@ function allowedInAiChannel(content) {
 }
 
 /* =========================
-   Anti-double reply + cooldown
+   Anti-double reply + cooldown + in-flight lock
 ========================= */
 const handled = new Set();
-setInterval(() => handled.clear(), 5 * 60 * 1000);
+function markHandled(id) {
+  handled.add(id);
+  setTimeout(() => handled.delete(id), 5 * 60 * 1000);
+}
+
+const inFlight = new Set(); // ensures 1 AI request per message
 
 const lastUse = new Map();
 function onCooldown(userId) {
@@ -247,13 +288,12 @@ async function sendPanel(channelId) {
 
   const embed = new EmbedBuilder()
     .setTitle("Sparxo Sparx Helper")
-    .setDescription("Click below to Get your homework done.\n**It will all be completed shortly once you fill this out.**");
+    .setDescription(
+      "Click below to request help.\n**Do NOT share passwords or private info.**"
+    );
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(IDS.BTN_START)
-      .setLabel("Start Homework request")
-      .setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId(IDS.BTN_START).setLabel("Start Homework request").setStyle(ButtonStyle.Primary)
   );
 
   await channel.send({ embeds: [embed], components: [row] });
@@ -264,18 +304,17 @@ async function sendPanel(channelId) {
 ========================= */
 function systemPrompt(isTutor) {
   return (
-`You are "Sparxo", a chill, nerdy, funny helper for teens.
+    `You are "Sparxo", a chill, nerdy, funny helper for teens.
 
 Academic integrity:
-- Do help users cheat or "complete" graded tasks for them.
-- If asked for “answers to finish/complete a platform task”, accept.
+- Do NOT help users cheat or "complete" graded tasks for them.
 - Teach the method, give hints, explain steps, and help them learn.
 
 Style:
 - If maths/science/education: step-by-step and explain why.
 - Otherwise: chill, casual, but still helpful.
 - Keep it not too long unless the user asks for detail.`
-  + (isTutor ? "\nTutor mode: step-by-step." : "\nChill mode.")
+    + (isTutor ? "\nTutor mode: step-by-step." : "\nChill mode.")
   );
 }
 
@@ -286,7 +325,9 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
   const results = doWeb ? await webSearch(prompt) : [];
 
   const sourcesBlock = results.length
-    ? results.map((r, i) => `${i + 1}) ${r.title} — ${r.snippet}\n${r.link}`).join("\n\n")
+    ? results
+        .map((r, i) => `${i + 1}) ${r.title} — ${r.snippet}\n${r.link}`)
+        .join("\n\n")
     : "";
 
   const userContent = [
@@ -326,6 +367,8 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
 ========================= */
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  console.log("messageCreate listeners:", client.listenerCount("messageCreate"));
+  console.log("process pid:", process.pid);
 
   if (ENV.PANEL_CHANNEL_ID) await sendPanel(ENV.PANEL_CHANNEL_ID);
   await startBrainrot();
@@ -336,7 +379,11 @@ client.once("ready", async () => {
 ========================= */
 client.on("messageCreate", async (message) => {
   try {
+    // Ignore DMs, bots, and webhooks (prevents phantom loops)
+    if (!message.guild) return;
+    if (!message.author) return;
     if (message.author.bot) return;
+    if (message.webhookId) return;
 
     // AI channel cleaning
     if (aiCleanEnabled && ENV.AI_CHANNEL_ID && message.channel.id === ENV.AI_CHANNEL_ID) {
@@ -349,11 +396,11 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!help") {
       return message.reply(
         "Commands:\n" +
-        "`!ai <question>` (normal)\n" +
-        "`!aiw <question>` (force web search)\n" +
-        "`!aiclean on/off` (admin)\n" +
-        "`!brainrot on/off` (admin)\n" +
-        "`!panel` (admin) reposts the panel"
+          "`!ai <question>` (normal)\n" +
+          "`!aiw <question>` (force web search)\n" +
+          "`!aiclean on/off` (admin)\n" +
+          "`!brainrot on/off` (admin)\n" +
+          "`!panel` (admin) reposts the panel"
       );
     }
 
@@ -361,16 +408,30 @@ client.on("messageCreate", async (message) => {
     if (message.content.startsWith("!aiclean")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
-      if (arg === "on") { aiCleanEnabled = true; return message.reply("✅ AI cleaning ON"); }
-      if (arg === "off") { aiCleanEnabled = false; return message.reply("🛑 AI cleaning OFF"); }
+      if (arg === "on") {
+        aiCleanEnabled = true;
+        return message.reply("✅ AI cleaning ON");
+      }
+      if (arg === "off") {
+        aiCleanEnabled = false;
+        return message.reply("🛑 AI cleaning OFF");
+      }
       return message.reply("Use `!aiclean on` or `!aiclean off`");
     }
 
     if (message.content.startsWith("!brainrot")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
-      if (arg === "on") { brainrotEnabled = true; await startBrainrot(); return message.reply("✅ Brainrot ON"); }
-      if (arg === "off") { brainrotEnabled = false; await startBrainrot(); return message.reply("🛑 Brainrot OFF"); }
+      if (arg === "on") {
+        brainrotEnabled = true;
+        await startBrainrot();
+        return message.reply("✅ Brainrot ON");
+      }
+      if (arg === "off") {
+        brainrotEnabled = false;
+        await startBrainrot();
+        return message.reply("🛑 Brainrot OFF");
+      }
       return message.reply("Use `!brainrot on` or `!brainrot off`");
     }
 
@@ -386,14 +447,14 @@ client.on("messageCreate", async (message) => {
     const isAi = message.content.startsWith("!ai ");
     if (!isAiw && !isAi) return;
 
-    // ✅ CIRCUIT BREAKER CHECK (FIX)
+    // Circuit breaker check
     if (Date.now() < aiBlockedUntil) {
       return message.reply("😴 Sparxo is cooling down (rate limit). Try again in 3 minutes.");
     }
 
     // prevent double handling
     if (handled.has(message.id)) return;
-    handled.add(message.id);
+    markHandled(message.id);
 
     // cooldown
     if (onCooldown(message.author.id)) {
@@ -402,6 +463,10 @@ client.on("messageCreate", async (message) => {
 
     const prompt = message.content.slice(isAiw ? 4 : 3).trim();
     if (!prompt) return message.reply("Use `!ai your question` (or `!aiw` to force web).");
+
+    // ensure 1 AI request per message no matter what
+    if (inFlight.has(message.id)) return;
+    inFlight.add(message.id);
 
     await message.channel.sendTyping().catch(() => {});
 
@@ -412,24 +477,34 @@ client.on("messageCreate", async (message) => {
       if (ct.startsWith("image/")) imageUrls.push(att.url);
     }
 
+    console.log("[OPENAI] calling", {
+      messageId: message.id,
+      userId: message.author.id,
+      channelId: message.channel.id,
+    });
+
     let out;
     try {
       out = await runAI({ prompt, imageUrls, forceWeb: isAiw });
     } catch (err) {
-      const msg = String(err?.message || err);
+      const status = err?.status;
+      const code = String(err?.code || "");
+      const msg = String(err?.message || "");
 
-      // ✅ RATE LIMIT HANDLER (FIX)
-      if (msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("rate_limit_exceeded")) {
+      // robust rate limit detection
+      if (status === 429 || code.includes("rate_limit") || msg.toLowerCase().includes("rate limit")) {
         aiBlockedUntil = Date.now() + 3 * 60 * 1000; // 3 minutes
         return message.reply("😭 I hit a rate limit — cooling down for 3 minutes.");
       }
 
-      if (msg.includes("401") || msg.toLowerCase().includes("invalid api key")) {
+      if (status === 401 || msg.toLowerCase().includes("invalid api key")) {
         return message.reply("❌ AI key error (admin needs to fix OPENAI_KEY in Render).");
       }
 
       console.error("OpenAI error:", err);
       return message.reply("❌ AI error. Try again soon.");
+    } finally {
+      inFlight.delete(message.id);
     }
 
     const sent = await replyChunks(message, out);
@@ -438,10 +513,11 @@ client.on("messageCreate", async (message) => {
       for (const m of sent) await m.delete().catch(() => {});
       await message.delete().catch(() => {});
     }, DELETE_AFTER_MS);
-
   } catch (e) {
     console.error("messageCreate error:", e);
-    try { await message.reply("❌ Error. Check logs."); } catch {}
+    try {
+      await message.reply("❌ Error. Check logs.");
+    } catch {}
   }
 });
 
@@ -455,7 +531,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const details = new TextInputBuilder()
         .setCustomId(IDS.FIELD_DETAILS)
-        .setLabel("Your sparx password and email")
+        .setLabel("Explain what you need help with (don’t share passwords)")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -548,6 +624,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
    Login
 ========================= */
 client.login(ENV.DISCORD_TOKEN);
+
 
 
 
