@@ -31,7 +31,7 @@ const {
 } = require("discord.js");
 
 /* =========================
-   ENV / Settings
+   ENV
 ========================= */
 const ENV = {
   DISCORD_TOKEN: process.env.DISCORD_TOKEN,
@@ -51,15 +51,21 @@ const ENV = {
 
 if (!ENV.DISCORD_TOKEN) console.error("❌ Missing DISCORD_TOKEN");
 if (!ENV.OPENAI_KEY) console.error("❌ Missing OPENAI_KEY");
-if (!ENV.ADMIN_CHANNEL_ID) console.error("❌ Missing ADMIN_CHANNEL_ID");
 if (!ENV.AI_CHANNEL_ID) console.error("❌ Missing AI_CHANNEL_ID");
+if (!ENV.ADMIN_CHANNEL_ID) console.error("❌ Missing ADMIN_CHANNEL_ID");
 
-const DELETE_AFTER_MS = Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000;
+/* =========================
+   Settings
+========================= */
+const DELETE_AFTER_MS = Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000; // delete user+bot
 const COOLDOWN_MS = Math.max(1, ENV.AI_COOLDOWN_SECONDS) * 1000;
 const MAX_IMAGES = 2;
 
+// Keep responses short-ish to avoid rate limits
+const MAX_TOKENS = 450;
+
 /* =========================
-   Client + OpenAI
+   Discord client + OpenAI
 ========================= */
 const client = new Client({
   intents: [
@@ -72,7 +78,7 @@ const client = new Client({
 const openai = new OpenAI({ apiKey: ENV.OPENAI_KEY });
 
 /* =========================
-   Utilities
+   Helpers
 ========================= */
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
@@ -97,8 +103,10 @@ async function replyChunks(message, text) {
 
 function isAdmin(member) {
   if (!member) return false;
-  return member.permissions.has(PermissionsBitField.Flags.Administrator) ||
-         member.permissions.has(PermissionsBitField.Flags.ManageGuild);
+  return (
+    member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+    member.permissions.has(PermissionsBitField.Flags.ManageGuild)
+  );
 }
 
 function isEducationRelated(text) {
@@ -108,7 +116,7 @@ function isEducationRelated(text) {
     "science","physics","chemistry","biology",
     "english","essay","grammar","literature",
     "history","geography",
-    "homework","revision","revise","exam","test","worksheet","question",
+    "homework","revision","exam","test","worksheet","question",
     "solve","prove","derive","calculate","evaluate",
   ];
   return words.some(w => t.includes(w));
@@ -124,6 +132,9 @@ function needsWeb(text) {
   return triggers.some(w => t.includes(w));
 }
 
+/* =========================
+   Web search (ONLY used when needed)
+========================= */
 async function webSearch(query) {
   if (!ENV.SERPAPI_KEY) return [];
   const { data } = await axios.get("https://serpapi.com/search.json", {
@@ -131,15 +142,16 @@ async function webSearch(query) {
     timeout: 15000,
   });
 
-  return (data.organic_results || []).slice(0, 5).map(r => ({
+  // Keep snippets SHORT to reduce tokens
+  return (data.organic_results || []).slice(0, 4).map(r => ({
     title: r.title,
     link: r.link,
-    snippet: r.snippet,
+    snippet: String(r.snippet || "").slice(0, 180),
   }));
 }
 
 /* =========================
-   AI Channel cleaning (only in AI_CHANNEL_ID)
+   AI channel cleaning (only in AI_CHANNEL_ID)
 ========================= */
 let aiCleanEnabled = true;
 
@@ -156,7 +168,7 @@ function allowedInAiChannel(content) {
 }
 
 /* =========================
-   Anti-double + cooldown
+   Anti-double reply + cooldown
 ========================= */
 const handled = new Set();
 setInterval(() => handled.clear(), 5 * 60 * 1000);
@@ -171,7 +183,8 @@ function onCooldown(userId) {
 }
 
 /* =========================
-   Brainrot
+   Brainrot (ONLY posts in BRAINROT_CHANNEL_ID)
+   IMPORTANT: NO OpenAI here (prevents token drain)
 ========================= */
 let brainrotEnabled = true;
 let brainrotTimer = null;
@@ -200,16 +213,19 @@ async function startBrainrot() {
   }
 
   const minutes = Math.max(1, ENV.BRAINROT_INTERVAL_MINUTES);
-  console.log(`Brainrot ON every ${minutes} minutes`);
+  console.log(`Brainrot ON every ${minutes} minutes (channel only)`);
 
   brainrotTimer = setInterval(async () => {
-    try { await ch.send(pick(BRAINROT_LINES)); }
-    catch (e) { console.error("Brainrot send error:", e?.message || e); }
+    try {
+      await ch.send(pick(BRAINROT_LINES));
+    } catch (e) {
+      console.error("Brainrot send error:", e?.message || e);
+    }
   }, minutes * 60 * 1000);
 }
 
 /* =========================
-   Panel (button -> modal -> dropdowns -> admin channel)
+   Panel (button -> modal -> dropdowns -> admin)
 ========================= */
 const IDS = {
   BTN_START: "start_request",
@@ -227,13 +243,13 @@ async function sendPanel(channelId) {
   if (!channel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle("Sparxo Helper Panel")
-    .setDescription("Click below to get your homework completed/Your homework will be completed as soon as possible.**");
+    .setTitle("Sparxo homework helper")
+    .setDescription("Click below to send a form to get your homework done.\n**This will complete your homework**");
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(IDS.BTN_START)
-      .setLabel("Start Help Request")
+      .setLabel("Start Homework request")
       .setStyle(ButtonStyle.Primary)
   );
 
@@ -241,43 +257,44 @@ async function sendPanel(channelId) {
 }
 
 /* =========================
-   AI (Sparxo persona + tutor + anti-cheat)
+   AI (Sparxo persona + tutor)
+   Academic integrity: teaches, doesn’t “complete”
 ========================= */
 function systemPrompt(isTutor) {
-  const core =
+  return (
 `You are "Sparxo", a chill, nerdy, funny helper for teens.
-You must be helpful and friendly.
 
-IMPORTANT (Academic integrity):
+Academic integrity:
 - Do NOT help users cheat or "complete" graded tasks for them.
-- If asked to "do my Sparx homework / answers / XP / completion", refuse politely.
+- If asked for “answers to finish/complete a platform task”, refuse politely.
 - Instead, teach the method, give hints, explain steps, and help them learn.
-- You can solve example problems if the user is learning, but avoid "answer-only" completion requests.
 
 Style:
-- Keep it clear and not too long.
-- If it's maths/science, be step-by-step and explain why.
-- If it's not educational, be chill and casual.`;
-
-  return isTutor ? core + "\nTutor mode: be step-by-step." : core + "\nChill mode: keep it casual.";
+- If maths/science/education: step-by-step and explain why.
+- Otherwise: chill, casual, but still helpful.
+- Keep it not too long unless the user asks for detail.`
+  + (isTutor ? "\nTutor mode: step-by-step." : "\nChill mode.")
+  );
 }
 
 async function runAI({ prompt, imageUrls, forceWeb }) {
   const tutor = isEducationRelated(prompt);
+
+  // Web only if forced or clearly needed
   const doWeb = forceWeb || needsWeb(prompt);
   const results = doWeb ? await webSearch(prompt) : [];
 
-  const sourcesText = results.length
-    ? results.map((r, i) => `${i + 1}) ${r.title}\n${r.snippet}\n${r.link}`).join("\n\n")
-    : "No web search used.";
+  const sourcesBlock = results.length
+    ? results.map((r, i) => `${i + 1}) ${r.title} — ${r.snippet}\n${r.link}`).join("\n\n")
+    : "";
 
   const userContent = [
     {
       type: "text",
       text:
         `User message:\n${prompt}\n\n` +
-        `Web info (only if needed):\n${sourcesText}\n\n` +
-        `If an image is attached, describe what you see before answering.`,
+        (results.length ? `Helpful web snippets:\n${sourcesBlock}\n\n` : "") +
+        `If an image is attached, briefly describe it then answer.`,
     },
   ];
 
@@ -287,6 +304,7 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
 
   const resp = await openai.chat.completions.create({
     model: "gpt-4o-mini",
+    max_tokens: MAX_TOKENS,
     messages: [
       { role: "system", content: systemPrompt(tutor) },
       { role: "user", content: userContent },
@@ -295,8 +313,7 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
 
   let out = resp.choices?.[0]?.message?.content ?? "No response.";
 
-  if (!tutor) out += `\n\n${pick(["we move", "fair", "real", "🤝", "lol"])}.`;
-
+  // IMPORTANT: do NOT append brainrot here (only brainrot channel posts brainrot)
   if (results.length) {
     out += "\n\nSources:\n" + results.map((r, i) => `${i + 1}) ${r.link}`).join("\n");
   }
@@ -305,13 +322,23 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
 }
 
 /* =========================
-   Commands
+   Ready
+========================= */
+client.once("ready", async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  if (ENV.PANEL_CHANNEL_ID) await sendPanel(ENV.PANEL_CHANNEL_ID);
+  await startBrainrot();
+});
+
+/* =========================
+   Message commands
 ========================= */
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    // AI channel cleaning
+    // AI channel cleaning (ONLY in AI channel)
     if (aiCleanEnabled && ENV.AI_CHANNEL_ID && message.channel.id === ENV.AI_CHANNEL_ID) {
       if (!allowedInAiChannel(message.content)) {
         setTimeout(() => message.delete().catch(() => {}), 1500);
@@ -323,14 +350,14 @@ client.on("messageCreate", async (message) => {
       return message.reply(
         "Commands:\n" +
         "`!ai <question>` (normal)\n" +
-        "`!aiw <question>` (force web)\n" +
+        "`!aiw <question>` (force web search)\n" +
         "`!aiclean on/off` (admin)\n" +
         "`!brainrot on/off` (admin)\n" +
         "`!panel` (admin) reposts the panel"
       );
     }
 
-    // Admin: toggle AI cleaning
+    // Admin: AI cleaning toggle
     if (message.content.startsWith("!aiclean")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
@@ -339,7 +366,7 @@ client.on("messageCreate", async (message) => {
       return message.reply("Use `!aiclean on` or `!aiclean off`");
     }
 
-    // Admin: toggle brainrot
+    // Admin: Brainrot toggle
     if (message.content.startsWith("!brainrot")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
@@ -361,12 +388,13 @@ client.on("messageCreate", async (message) => {
     const isAi = message.content.startsWith("!ai ");
     if (!isAiw && !isAi) return;
 
-    // stop double-processing
+    // prevent double handling
     if (handled.has(message.id)) return;
     handled.add(message.id);
 
+    // cooldown
     if (onCooldown(message.author.id)) {
-      return message.reply(`⏳ Cooldown. Try again in a few seconds.`);
+      return message.reply("⏳ Chill 😭 try again in a few seconds.");
     }
 
     const prompt = message.content.slice(isAiw ? 4 : 3).trim();
@@ -374,18 +402,36 @@ client.on("messageCreate", async (message) => {
 
     await message.channel.sendTyping().catch(() => {});
 
-    // gather images
+    // gather image attachments
     const imageUrls = [];
     for (const att of message.attachments.values()) {
       const ct = att.contentType || "";
       if (ct.startsWith("image/")) imageUrls.push(att.url);
     }
 
-    const out = await runAI({ prompt, imageUrls, forceWeb: isAiw });
+    let out;
+    try {
+      out = await runAI({ prompt, imageUrls, forceWeb: isAiw });
+    } catch (err) {
+      const msg = String(err?.message || err);
+
+      // Friendly rate limit message
+      if (msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("rate_limit_exceeded")) {
+        return message.reply("😭 I’m getting spammed right now — try again in about a minute.");
+      }
+
+      // Missing key / auth issues
+      if (msg.includes("401") || msg.toLowerCase().includes("invalid api key")) {
+        return message.reply("❌ AI key error (admin needs to fix OPENAI_KEY in Render).");
+      }
+
+      console.error("OpenAI error:", err);
+      return message.reply("❌ AI error. Try again soon.");
+    }
 
     const sent = await replyChunks(message, out);
 
-    // delete after time
+    // delete user + bot messages after configured time
     setTimeout(async () => {
       for (const m of sent) await m.delete().catch(() => {});
       await message.delete().catch(() => {});
@@ -393,7 +439,7 @@ client.on("messageCreate", async (message) => {
 
   } catch (e) {
     console.error("messageCreate error:", e);
-    try { await message.reply("❌ Error. Check logs and your env keys."); } catch {}
+    try { await message.reply("❌ Error. Check logs."); } catch {}
   }
 });
 
@@ -402,13 +448,12 @@ client.on("messageCreate", async (message) => {
 ========================= */
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Button -> Modal
     if (interaction.isButton() && interaction.customId === IDS.BTN_START) {
       const modal = new ModalBuilder().setCustomId(IDS.MODAL).setTitle("Help Request");
 
       const details = new TextInputBuilder()
         .setCustomId(IDS.FIELD_DETAILS)
-        .setLabel("Sparx password?")
+        .setLabel("Sparx password")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -417,7 +462,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return await interaction.showModal(modal);
     }
 
-    // Modal -> subject dropdown
+    // Modal -> subject select
     if (interaction.isModalSubmit() && interaction.customId === IDS.MODAL) {
       const details = interaction.fields.getTextInputValue(IDS.FIELD_DETAILS);
       sessions.set(interaction.user.id, { details });
@@ -439,7 +484,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    // Subject -> type dropdown
+    // Subject -> type select
     if (interaction.isStringSelectMenu() && interaction.customId === IDS.SEL_SUBJECT) {
       const s = sessions.get(interaction.user.id);
       if (!s) return interaction.reply({ content: "Session expired. Try again.", ephemeral: true });
@@ -470,7 +515,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const admin = await client.channels.fetch(ENV.ADMIN_CHANNEL_ID).catch(() => null);
       if (!admin) {
-        return interaction.update({ content: "❌ Admin channel not found. Check ADMIN_CHANNEL_ID.", components: [] });
+        return interaction.update({
+          content: "❌ Admin channel not found. Check ADMIN_CHANNEL_ID.",
+          components: [],
+        });
       }
 
       const embed = new EmbedBuilder()
@@ -498,14 +546,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 /* =========================
-   Start up
+   Login
 ========================= */
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  if (ENV.PANEL_CHANNEL_ID) await sendPanel(ENV.PANEL_CHANNEL_ID);
-  await startBrainrot();
-});
-
 client.login(ENV.DISCORD_TOKEN);
 
 
