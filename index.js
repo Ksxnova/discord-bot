@@ -455,7 +455,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const details = new TextInputBuilder()
         .setCustomId(IDS.FIELD_DETAILS)
-        .setLabel("Paste the question / topic you need help with")
+        .setLabel("Your sparx password and email")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -548,6 +548,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
    Login
 ========================= */
 client.login(ENV.DISCORD_TOKEN);
+
 
 
 
