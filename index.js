@@ -79,6 +79,7 @@ const openai = new OpenAI({ apiKey: ENV.OPENAI_KEY });
 
 /* =========================
    RATE-LIMIT CIRCUIT BREAKER
+   Only trip it on real OpenAI 429 / rate_limit code
 ========================= */
 let aiBlockedUntil = 0;
 
@@ -288,12 +289,13 @@ async function sendPanel(channelId) {
 
   const embed = new EmbedBuilder()
     .setTitle("Sparxo Sparx Helper")
-    .setDescription(
-      "Click below to request help.\n**Do NOT share passwords or private info.**"
-    );
+    .setDescription("Click below to request help.\n**Do NOT share passwords or private info.**");
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(IDS.BTN_START).setLabel("Start Homework request").setStyle(ButtonStyle.Primary)
+    new ButtonBuilder()
+      .setCustomId(IDS.BTN_START)
+      .setLabel("Start Homework request")
+      .setStyle(ButtonStyle.Primary)
   );
 
   await channel.send({ embeds: [embed], components: [row] });
@@ -325,9 +327,7 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
   const results = doWeb ? await webSearch(prompt) : [];
 
   const sourcesBlock = results.length
-    ? results
-        .map((r, i) => `${i + 1}) ${r.title} — ${r.snippet}\n${r.link}`)
-        .join("\n\n")
+    ? results.map((r, i) => `${i + 1}) ${r.title} — ${r.snippet}\n${r.link}`).join("\n\n")
     : "";
 
   const userContent = [
@@ -447,9 +447,11 @@ client.on("messageCreate", async (message) => {
     const isAi = message.content.startsWith("!ai ");
     if (!isAiw && !isAi) return;
 
-    // Circuit breaker check
+    // Circuit breaker check + show remaining time
     if (Date.now() < aiBlockedUntil) {
-      return message.reply("😴 Sparxo is cooling down (rate limit). Try again in 3 minutes.");
+      const leftMs = aiBlockedUntil - Date.now();
+      const leftSec = Math.ceil(leftMs / 1000);
+      return message.reply(`😴 Sparxo is cooling down (rate limit). Try again in ${leftSec}s.`);
     }
 
     // prevent double handling
@@ -481,27 +483,30 @@ client.on("messageCreate", async (message) => {
       messageId: message.id,
       userId: message.author.id,
       channelId: message.channel.id,
+      forceWeb: isAiw,
     });
 
     let out;
     try {
       out = await runAI({ prompt, imageUrls, forceWeb: isAiw });
     } catch (err) {
-      const status = err?.status;
-      const code = String(err?.code || "");
+      const status = err?.status ?? err?.response?.status;
+      const code = String(err?.code || err?.error?.code || "");
       const msg = String(err?.message || "");
 
-      // robust rate limit detection
-      if (status === 429 || code.includes("rate_limit") || msg.toLowerCase().includes("rate limit")) {
-        aiBlockedUntil = Date.now() + 3 * 60 * 1000; // 3 minutes
-        return message.reply("😭 I hit a rate limit — cooling down for 3 minutes.");
+      console.error("[OPENAI ERROR]", { status, code, message: msg });
+
+      // ✅ only trip circuit breaker on real 429 / rate_limit code
+      if (status === 429 || code.includes("rate_limit")) {
+        aiBlockedUntil = Date.now() + 3 * 60 * 1000;
+        console.error("[AI BLOCK] OpenAI rate limit. Blocking until:", new Date(aiBlockedUntil).toISOString());
+        return message.reply("😭 OpenAI rate limit — cooling down for 3 minutes.");
       }
 
       if (status === 401 || msg.toLowerCase().includes("invalid api key")) {
         return message.reply("❌ AI key error (admin needs to fix OPENAI_KEY in Render).");
       }
 
-      console.error("OpenAI error:", err);
       return message.reply("❌ AI error. Try again soon.");
     } finally {
       inFlight.delete(message.id);
@@ -624,6 +629,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
    Login
 ========================= */
 client.login(ENV.DISCORD_TOKEN);
+
 
 
 
