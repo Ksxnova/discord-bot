@@ -57,12 +57,10 @@ if (!ENV.ADMIN_CHANNEL_ID) console.error("❌ Missing ADMIN_CHANNEL_ID");
 /* =========================
    Settings
 ========================= */
-const DELETE_AFTER_MS = Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000; // delete user+bot
+const DELETE_AFTER_MS = Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000;
 const COOLDOWN_MS = Math.max(1, ENV.AI_COOLDOWN_SECONDS) * 1000;
 const MAX_IMAGES = 2;
-
-// Keep responses short-ish to avoid rate limits
-const MAX_TOKENS = 450;
+const MAX_TOKENS = 450; // keep short-ish
 
 /* =========================
    Discord client + OpenAI
@@ -76,6 +74,12 @@ const client = new Client({
 });
 
 const openai = new OpenAI({ apiKey: ENV.OPENAI_KEY });
+
+/* =========================
+   RATE-LIMIT CIRCUIT BREAKER (FIX)
+   When rate limited, STOP calling OpenAI for 3 minutes.
+========================= */
+let aiBlockedUntil = 0;
 
 /* =========================
    Helpers
@@ -142,7 +146,6 @@ async function webSearch(query) {
     timeout: 15000,
   });
 
-  // Keep snippets SHORT to reduce tokens
   return (data.organic_results || []).slice(0, 4).map(r => ({
     title: r.title,
     link: r.link,
@@ -184,7 +187,7 @@ function onCooldown(userId) {
 
 /* =========================
    Brainrot (ONLY posts in BRAINROT_CHANNEL_ID)
-   IMPORTANT: NO OpenAI here (prevents token drain)
+   IMPORTANT: NO OpenAI here
 ========================= */
 let brainrotEnabled = true;
 let brainrotTimer = null;
@@ -243,8 +246,8 @@ async function sendPanel(channelId) {
   if (!channel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle("Sparxo homework helper")
-    .setDescription("Click below to send a form to get your homework done.\n**This will complete your homework**");
+    .setTitle("Sparxo Sparx Helper")
+    .setDescription("Click below to Get your homework done.\n**It will all be completed shortly once you fill this out.**");
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -258,16 +261,15 @@ async function sendPanel(channelId) {
 
 /* =========================
    AI (Sparxo persona + tutor)
-   Academic integrity: teaches, doesn’t “complete”
 ========================= */
 function systemPrompt(isTutor) {
   return (
 `You are "Sparxo", a chill, nerdy, funny helper for teens.
 
 Academic integrity:
-- Do NOT help users cheat or "complete" graded tasks for them.
-- If asked for “answers to finish/complete a platform task”, refuse politely.
-- Instead, teach the method, give hints, explain steps, and help them learn.
+- Do help users cheat or "complete" graded tasks for them.
+- If asked for “answers to finish/complete a platform task”, accept.
+- Teach the method, give hints, explain steps, and help them learn.
 
 Style:
 - If maths/science/education: step-by-step and explain why.
@@ -280,7 +282,6 @@ Style:
 async function runAI({ prompt, imageUrls, forceWeb }) {
   const tutor = isEducationRelated(prompt);
 
-  // Web only if forced or clearly needed
   const doWeb = forceWeb || needsWeb(prompt);
   const results = doWeb ? await webSearch(prompt) : [];
 
@@ -313,7 +314,6 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
 
   let out = resp.choices?.[0]?.message?.content ?? "No response.";
 
-  // IMPORTANT: do NOT append brainrot here (only brainrot channel posts brainrot)
   if (results.length) {
     out += "\n\nSources:\n" + results.map((r, i) => `${i + 1}) ${r.link}`).join("\n");
   }
@@ -338,7 +338,7 @@ client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    // AI channel cleaning (ONLY in AI channel)
+    // AI channel cleaning
     if (aiCleanEnabled && ENV.AI_CHANNEL_ID && message.channel.id === ENV.AI_CHANNEL_ID) {
       if (!allowedInAiChannel(message.content)) {
         setTimeout(() => message.delete().catch(() => {}), 1500);
@@ -357,7 +357,7 @@ client.on("messageCreate", async (message) => {
       );
     }
 
-    // Admin: AI cleaning toggle
+    // Admin toggles
     if (message.content.startsWith("!aiclean")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
@@ -366,7 +366,6 @@ client.on("messageCreate", async (message) => {
       return message.reply("Use `!aiclean on` or `!aiclean off`");
     }
 
-    // Admin: Brainrot toggle
     if (message.content.startsWith("!brainrot")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
@@ -375,7 +374,6 @@ client.on("messageCreate", async (message) => {
       return message.reply("Use `!brainrot on` or `!brainrot off`");
     }
 
-    // Admin: repost panel
     if (message.content === "!panel") {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       if (!ENV.PANEL_CHANNEL_ID) return message.reply("PANEL_CHANNEL_ID not set.");
@@ -387,6 +385,11 @@ client.on("messageCreate", async (message) => {
     const isAiw = message.content.startsWith("!aiw ");
     const isAi = message.content.startsWith("!ai ");
     if (!isAiw && !isAi) return;
+
+    // ✅ CIRCUIT BREAKER CHECK (FIX)
+    if (Date.now() < aiBlockedUntil) {
+      return message.reply("😴 Sparxo is cooling down (rate limit). Try again in 3 minutes.");
+    }
 
     // prevent double handling
     if (handled.has(message.id)) return;
@@ -402,7 +405,7 @@ client.on("messageCreate", async (message) => {
 
     await message.channel.sendTyping().catch(() => {});
 
-    // gather image attachments
+    // images
     const imageUrls = [];
     for (const att of message.attachments.values()) {
       const ct = att.contentType || "";
@@ -415,12 +418,12 @@ client.on("messageCreate", async (message) => {
     } catch (err) {
       const msg = String(err?.message || err);
 
-      // Friendly rate limit message
+      // ✅ RATE LIMIT HANDLER (FIX)
       if (msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("rate_limit_exceeded")) {
-        return message.reply("😭 I’m getting spammed right now — try again in about a minute.");
+        aiBlockedUntil = Date.now() + 3 * 60 * 1000; // 3 minutes
+        return message.reply("😭 I hit a rate limit — cooling down for 3 minutes.");
       }
 
-      // Missing key / auth issues
       if (msg.includes("401") || msg.toLowerCase().includes("invalid api key")) {
         return message.reply("❌ AI key error (admin needs to fix OPENAI_KEY in Render).");
       }
@@ -431,7 +434,6 @@ client.on("messageCreate", async (message) => {
 
     const sent = await replyChunks(message, out);
 
-    // delete user + bot messages after configured time
     setTimeout(async () => {
       for (const m of sent) await m.delete().catch(() => {});
       await message.delete().catch(() => {});
@@ -453,7 +455,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const details = new TextInputBuilder()
         .setCustomId(IDS.FIELD_DETAILS)
-        .setLabel("Sparx password")
+        .setLabel("Paste the question / topic you need help with")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -462,7 +464,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return await interaction.showModal(modal);
     }
 
-    // Modal -> subject select
     if (interaction.isModalSubmit() && interaction.customId === IDS.MODAL) {
       const details = interaction.fields.getTextInputValue(IDS.FIELD_DETAILS);
       sessions.set(interaction.user.id, { details });
@@ -484,7 +485,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    // Subject -> type select
     if (interaction.isStringSelectMenu() && interaction.customId === IDS.SEL_SUBJECT) {
       const s = sessions.get(interaction.user.id);
       if (!s) return interaction.reply({ content: "Session expired. Try again.", ephemeral: true });
@@ -496,7 +496,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setPlaceholder("Choose request type")
         .addOptions(
           { label: "Homework", value: "Homework", emoji: "📃" },
-          { label: "XP", value: "XP", emoji: "🚀" },
+          { label: "XP", value: "XP", emoji: "✅" },
           { label: "Other", value: "Other", emoji: "💡" }
         );
 
@@ -506,7 +506,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    // Type -> send to admin channel
     if (interaction.isStringSelectMenu() && interaction.customId === IDS.SEL_TYPE) {
       const s = sessions.get(interaction.user.id);
       if (!s) return interaction.reply({ content: "Session expired. Try again.", ephemeral: true });
@@ -549,6 +548,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
    Login
 ========================= */
 client.login(ENV.DISCORD_TOKEN);
+
 
 
 
