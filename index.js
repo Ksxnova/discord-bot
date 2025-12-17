@@ -1,20 +1,6 @@
 require("dotenv").config();
 
-/* =========================
-   Render keep-alive (FREE web service needs a port)
-========================= */
 const http = require("http");
-const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("sparxo online\n");
-  })
-  .listen(PORT, () => console.log("Keep-alive server on", PORT));
-
-/* =========================
-   Imports
-========================= */
 const axios = require("axios");
 const OpenAI = require("openai");
 const crypto = require("crypto");
@@ -31,7 +17,19 @@ const {
   TextInputStyle,
   StringSelectMenuBuilder,
   PermissionsBitField,
+  ChannelType,
 } = require("discord.js");
+
+/* =========================
+   Keep-alive (Render needs a port)
+========================= */
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("sparxo online\n");
+  })
+  .listen(PORT, () => console.log("Keep-alive server on", PORT));
 
 /* =========================
    ENV
@@ -52,82 +50,113 @@ const ENV = {
   AI_COOLDOWN_SECONDS: Number(process.env.AI_COOLDOWN_SECONDS || 10),
 };
 
-if (!ENV.DISCORD_TOKEN) console.error("❌ Missing DISCORD_TOKEN");
-if (!ENV.OPENAI_KEY) console.error("❌ Missing OPENAI_KEY");
-if (!ENV.AI_CHANNEL_ID) console.error("❌ Missing AI_CHANNEL_ID");
-if (!ENV.ADMIN_CHANNEL_ID) console.error("❌ Missing ADMIN_CHANNEL_ID");
+function requireEnv(key, value) {
+  if (!value) console.error(`❌ Missing ${key}`);
+}
+requireEnv("DISCORD_TOKEN", ENV.DISCORD_TOKEN);
+requireEnv("OPENAI_KEY", ENV.OPENAI_KEY);
+requireEnv("AI_CHANNEL_ID", ENV.AI_CHANNEL_ID);
+requireEnv("ADMIN_CHANNEL_ID", ENV.ADMIN_CHANNEL_ID);
+
+const SETTINGS = {
+  DELETE_AFTER_MS: Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000,
+  COOLDOWN_MS: Math.max(1, ENV.AI_COOLDOWN_SECONDS) * 1000,
+  MAX_IMAGES: 2,
+  MAX_TOKENS: 450,
+  MODEL: "gpt-4o-mini",
+  MEMORY_TURNS: 8,          // added: short memory
+  MEMORY_TTL_MS: 45 * 60 * 1000,
+};
 
 /* =========================
-   Settings
-========================= */
-const DELETE_AFTER_MS = Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000;
-const COOLDOWN_MS = Math.max(1, ENV.AI_COOLDOWN_SECONDS) * 1000;
-const MAX_IMAGES = 2;
-const MAX_TOKENS = 450;
-
-/* =========================
-   Discord client + OpenAI
+   Client + OpenAI
 ========================= */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages, // added: DM support
   ],
 });
 
 const openai = new OpenAI({ apiKey: ENV.OPENAI_KEY });
 
 /* =========================
-   Circuit breaker + locks
+   State: cooldowns / locks
 ========================= */
 let aiBlockedUntil = 0;
+let globalAiBusy = false;
 
-// global mutex (stops bursts / parallel calls)
-let globalAiInFlight = false;
+const inFlightByMessage = new Set();
+const handledMessageIds = new Set();
 
-// per-message in-flight lock
-const inFlight = new Set();
-
-// message dedupe (prevents double handling)
-const handled = new Set();
 function markHandled(id) {
-  handled.add(id);
-  setTimeout(() => handled.delete(id), 5 * 60 * 1000);
+  handledMessageIds.add(id);
+  setTimeout(() => handledMessageIds.delete(id), 5 * 60 * 1000);
 }
 
-// per-user cooldown
-const lastUse = new Map();
-function onCooldown(userId) {
+const lastUseByUser = new Map();
+function isOnCooldown(userId) {
   const now = Date.now();
-  const prev = lastUse.get(userId) || 0;
-  if (now - prev < COOLDOWN_MS) return true;
-  lastUse.set(userId, now);
+  const prev = lastUseByUser.get(userId) || 0;
+  if (now - prev < SETTINGS.COOLDOWN_MS) return true;
+  lastUseByUser.set(userId, now);
   return false;
+}
+
+/* =========================
+   Added: conversation memory
+   Keyed by (userId + locationId)
+========================= */
+const memory = new Map(); // key -> { updatedAt, turns: [{role, content}] }
+
+function memKey(userId, locationId) {
+  return `${userId}:${locationId}`;
+}
+
+function getMemory(userId, locationId) {
+  const k = memKey(userId, locationId);
+  const v = memory.get(k);
+  if (!v) return [];
+  if (Date.now() - v.updatedAt > SETTINGS.MEMORY_TTL_MS) {
+    memory.delete(k);
+    return [];
+  }
+  return v.turns || [];
+}
+
+function pushMemory(userId, locationId, role, content) {
+  const k = memKey(userId, locationId);
+  const turns = getMemory(userId, locationId).slice(); // ensures TTL check
+  turns.push({ role, content });
+  const trimmed = turns.slice(-SETTINGS.MEMORY_TURNS * 2); // ~turn pairs
+  memory.set(k, { updatedAt: Date.now(), turns: trimmed });
+}
+
+// periodic cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of memory.entries()) {
+    if (!v?.updatedAt || now - v.updatedAt > SETTINGS.MEMORY_TTL_MS) memory.delete(k);
+  }
+}, 10 * 60 * 1000);
+
+/* =========================
+   Added: reply-to-continue mapping
+========================= */
+const botReplyToLocation = new Map(); // botMessageId -> { userId, locationId }
+function rememberBotReply(botMsgId, userId, locationId) {
+  botReplyToLocation.set(botMsgId, { userId, locationId, t: Date.now() });
+  setTimeout(() => botReplyToLocation.delete(botMsgId), 60 * 60 * 1000);
 }
 
 /* =========================
    Helpers
 ========================= */
-function pick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function chunkText(text, size = 1900) {
-  const t = String(text || "");
-  const chunks = [];
-  for (let i = 0; i < t.length; i += size) chunks.push(t.slice(i, i + size));
-  return chunks.length ? chunks : [""];
-}
-
-async function replyChunks(message, text) {
-  const chunks = chunkText(text);
-  const sent = [];
-  for (const part of chunks) {
-    const m = await message.reply(part);
-    sent.push(m);
-  }
-  return sent;
+function safeKeyHash(key) {
+  if (!key) return "missing";
+  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 12);
 }
 
 function isAdmin(member) {
@@ -148,41 +177,65 @@ function isEducationRelated(text) {
     "homework","revision","exam","test","worksheet","question",
     "solve","prove","derive","calculate","evaluate",
   ];
-  return words.some(w => t.includes(w));
+  return words.some((w) => t.includes(w));
 }
 
 function needsWeb(text) {
   const t = (text || "").toLowerCase();
-  const triggers = [
+  return [
     "latest","today","current","news","update","updated","release","version",
-    "price","cost","in stock","availability",
-    "2024","2025","2026",
-  ];
-  return triggers.some(w => t.includes(w));
+    "price","cost","in stock","availability","2024","2025","2026",
+  ].some((w) => t.includes(w));
 }
 
 function parseRetryAfterMs(msgLower) {
   const m = msgLower.match(/try again in\s+(\d+)m(\d+)s/i);
-  if (m) {
-    const mins = Number(m[1]);
-    const secs = Number(m[2]);
-    if (Number.isFinite(mins) && Number.isFinite(secs)) return (mins * 60 + secs) * 1000;
-  }
+  if (m) return (Number(m[1]) * 60 + Number(m[2])) * 1000;
   const s = msgLower.match(/try again in\s+(\d+)s/i);
-  if (s) {
-    const secs = Number(s[1]);
-    if (Number.isFinite(secs)) return secs * 1000;
-  }
+  if (s) return Number(s[1]) * 1000;
   return null;
 }
 
-function safeKeyHash(key) {
-  if (!key) return "missing";
-  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 12);
+/* =========================
+   Clean embed reply
+========================= */
+function splitForEmbed(text, maxLen = 3800) {
+  const s = String(text || "").trim();
+  if (!s) return ["(no response)"];
+  const parts = [];
+  for (let i = 0; i < s.length; i += maxLen) parts.push(s.slice(i, i + maxLen));
+  return parts;
+}
+
+async function replyClean(message, answerText, userId, locationId) {
+  const parts = splitForEmbed(answerText, 3800);
+  const sent = [];
+
+  const first = new EmbedBuilder().setDescription(parts[0]);
+  const m1 = await message.reply({ embeds: [first] });
+  sent.push(m1);
+  rememberBotReply(m1.id, userId, locationId);
+
+  // at most 2 extra clean embeds
+  for (let i = 1; i < parts.length && i < 3; i++) {
+    const e = new EmbedBuilder().setDescription(parts[i]);
+    const mi = await message.channel.send({ embeds: [e] });
+    sent.push(mi);
+    rememberBotReply(mi.id, userId, locationId);
+  }
+
+  if (parts.length > 3) {
+    const e = new EmbedBuilder().setDescription("…(trimmed)");
+    const mt = await message.channel.send({ embeds: [e] });
+    sent.push(mt);
+    rememberBotReply(mt.id, userId, locationId);
+  }
+
+  return sent;
 }
 
 /* =========================
-   Web search (ONLY used when needed)
+   Web search (SerpAPI)
 ========================= */
 async function webSearch(query) {
   if (!ENV.SERPAPI_KEY) return [];
@@ -191,7 +244,7 @@ async function webSearch(query) {
     timeout: 15000,
   });
 
-  return (data.organic_results || []).slice(0, 4).map(r => ({
+  return (data.organic_results || []).slice(0, 4).map((r) => ({
     title: r.title,
     link: r.link,
     snippet: String(r.snippet || "").slice(0, 180),
@@ -199,7 +252,7 @@ async function webSearch(query) {
 }
 
 /* =========================
-   AI channel cleaning (only in AI_CHANNEL_ID)
+   AI channel cleaning
 ========================= */
 let aiCleanEnabled = true;
 
@@ -218,21 +271,34 @@ function allowedInAiChannel(content) {
 }
 
 /* =========================
-   Brainrot (ONLY posts in BRAINROT_CHANNEL_ID)
-   IMPORTANT: NO OpenAI here
+   Brainrot (channel-only, no OpenAI)
 ========================= */
 let brainrotEnabled = true;
 let brainrotTimer = null;
 
 const BRAINROT_LINES = [
   "67 67 67",
-  "admin abuse is on today ✅",
-  "admin abuse is not on today ❌",
+  "Sparxo admin abuse is on today ✅",
+  "Sparxo admin abuse is not on today ❌",
   "math is NOT mathing",
   "certified nerd moment 🤓",
   "we move",
   "bro forgot the minus sign again",
+   "why is the toaster crying",
+   "my fridge just sent me a text",
+   "quantum squirrels stole my homework",
+   "i put a shoe on my cat and now it can speak French",
+ "pineapples are secretly plotting with my socks",
+   "did you know memes have a pet dimension",
+ "the walls are auditioning for a Broadway show",
+ "cats know the secrets of the WiFi",
+ "my coffee is judging me",
+ "aliens declined my invitation to dinner"
 ];
+
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
 
 async function startBrainrot() {
   if (brainrotTimer) clearInterval(brainrotTimer);
@@ -242,10 +308,7 @@ async function startBrainrot() {
   if (!ENV.BRAINROT_CHANNEL_ID) return;
 
   const ch = await client.channels.fetch(ENV.BRAINROT_CHANNEL_ID).catch(() => null);
-  if (!ch) {
-    console.error("Brainrot channel not found. Check BRAINROT_CHANNEL_ID.");
-    return;
-  }
+  if (!ch) return console.error("Brainrot channel not found. Check BRAINROT_CHANNEL_ID.");
 
   const minutes = Math.max(1, ENV.BRAINROT_INTERVAL_MINUTES);
   console.log(`Brainrot ON every ${minutes} minutes (channel only)`);
@@ -260,7 +323,7 @@ async function startBrainrot() {
 }
 
 /* =========================
-   Panel (button -> modal -> dropdowns -> admin)
+   Panel
 ========================= */
 const IDS = {
   BTN_START: "start_request",
@@ -269,7 +332,6 @@ const IDS = {
   SEL_SUBJECT: "sel_subject",
   SEL_TYPE: "sel_type",
 };
-
 const sessions = new Map();
 
 async function sendPanel(channelId) {
@@ -278,41 +340,71 @@ async function sendPanel(channelId) {
   if (!channel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle("Sparxo Helper Panel")
-    .setDescription("Click below to request help.\n**Do NOT share passwords or private info.**");
+    .setTitle("Sparxo Homework completer")
+    .setDescription("Click below to get your homework done.\n**All of your homework or xp u wanted will be completed.**");
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(IDS.BTN_START)
-      .setLabel("Start request")
-      .setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId(IDS.BTN_START).setLabel("Start request").setStyle(ButtonStyle.Primary)
   );
 
   await channel.send({ embeds: [embed], components: [row] });
 }
 
 /* =========================
-   AI (Sparxo persona + tutor)
+   Added: per-user thread in AI channel
 ========================= */
-function systemPrompt(isTutor) {
+async function getOrCreateUserThread(message) {
+  if (!message.guild) return null;
+  if (!ENV.AI_CHANNEL_ID) return null;
+  if (message.channel.id !== ENV.AI_CHANNEL_ID) return null;
+
+  const parent = message.channel;
+  const threadName = `sparxo-${message.author.username}`.slice(0, 90);
+
+  const active = await parent.threads.fetchActive().catch(() => null);
+  const existing = active?.threads?.find((t) => t.name === threadName);
+  if (existing) return existing;
+
+  const thread = await parent.threads.create({
+    name: threadName,
+    autoArchiveDuration: 60,
+    reason: `Sparxo session for ${message.author.tag}`,
+  });
+
+  return thread;
+}
+
+function isSparxoThread(channel) {
   return (
-`You are "Sparxo", a chill, nerdy, funny helper for teens.
-
-Academic integrity:
-- Do NOT help users cheat or complete graded tasks.
-- Teach the method, give hints, explain steps, and help them learn.
-
-Style:
-- If education: step-by-step and explain why.
-- Otherwise: chill + helpful.
-- Keep it not too long unless asked.`
-    + (isTutor ? "\nTutor mode: step-by-step." : "\nChill mode.")
+    channel?.isThread?.() &&
+    typeof channel.name === "string" &&
+    channel.name.startsWith("sparxo-")
   );
 }
 
-async function runAI({ prompt, imageUrls, forceWeb }) {
-  const tutor = isEducationRelated(prompt);
+/* =========================
+   OpenAI call (clean output + memory)
+========================= */
+function systemPrompt(isTutor) {
+  return (
+`You are "Sparxo", a helpful assistant for teens.
 
+Output rules:
+- Give ONLY the answer. No meta talk.
+- Keep it clean and direct.
+- No random jokes or filler.
+- If schoolwork: explain method/steps so the user learns.
+
+If maths/science:
+- Use numbered steps.
+- Keep equations on separate lines.
+- Final answer on its own line.`
+  + (isTutor ? "\nTutor mode: step-by-step." : "\nNormal mode.")
+  );
+}
+
+async function runAI({ prompt, imageUrls, forceWeb, memoryTurns }) {
+  const tutor = isEducationRelated(prompt);
   const doWeb = forceWeb || needsWeb(prompt);
   const results = doWeb ? await webSearch(prompt) : [];
 
@@ -325,31 +417,28 @@ async function runAI({ prompt, imageUrls, forceWeb }) {
       type: "text",
       text:
         `User message:\n${prompt}\n\n` +
-        (results.length ? `Helpful web snippets:\n${sourcesBlock}\n\n` : "") +
-        `If an image is attached, briefly describe it then answer.`,
+        (results.length ? `Helpful web snippets (summarize, don't quote):\n${sourcesBlock}\n\n` : "") +
+        `Return ONLY the final answer. No "Sources" section.`,
     },
   ];
 
-  for (const url of (imageUrls || []).slice(0, MAX_IMAGES)) {
+  for (const url of (imageUrls || []).slice(0, SETTINGS.MAX_IMAGES)) {
     userContent.push({ type: "image_url", image_url: { url } });
   }
 
+  const messages = [
+    { role: "system", content: systemPrompt(tutor) },
+    ...(memoryTurns || []),
+    { role: "user", content: userContent },
+  ];
+
   const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    max_tokens: MAX_TOKENS,
-    messages: [
-      { role: "system", content: systemPrompt(tutor) },
-      { role: "user", content: userContent },
-    ],
+    model: SETTINGS.MODEL,
+    max_tokens: SETTINGS.MAX_TOKENS,
+    messages,
   });
 
-  let out = resp.choices?.[0]?.message?.content ?? "No response.";
-
-  if (results.length) {
-    out += "\n\nSources:\n" + results.map((r, i) => `${i + 1}) ${r.link}`).join("\n");
-  }
-
-  return out;
+  return (resp.choices?.[0]?.message?.content ?? "").trim() || "No response.";
 }
 
 /* =========================
@@ -366,136 +455,202 @@ client.once("ready", async () => {
 });
 
 /* =========================
-   Message commands
+   messageCreate
 ========================= */
 client.on("messageCreate", async (message) => {
   try {
-    // Prevent phantom triggers / loops
-    if (!message.guild) return;
+    const isDM = message.channel.type === ChannelType.DM;
+
+    // Prevent loops
     if (!message.author) return;
     if (message.author.bot) return;
     if (message.webhookId) return;
 
-    // AI channel cleaning
-    if (aiCleanEnabled && ENV.AI_CHANNEL_ID && message.channel.id === ENV.AI_CHANNEL_ID) {
+    // AI channel cleaning (server only)
+    if (!isDM && aiCleanEnabled && ENV.AI_CHANNEL_ID && message.channel.id === ENV.AI_CHANNEL_ID) {
       if (!allowedInAiChannel(message.content)) {
         setTimeout(() => message.delete().catch(() => {}), 1500);
         return;
       }
     }
 
-    if (message.content === "!help") {
+    /* =========================
+       Admin / help commands (work in server)
+    ========================= */
+    if (!isDM && message.content === "!help") {
       return message.reply(
         "Commands:\n" +
-        "`!ai <question>` (normal)\n" +
-        "`!aiw <question>` (force web search)\n" +
+        "`!ai <question>`\n" +
+        "`!aiw <question>` (force web)\n" +
         "`!aiclean on/off` (admin)\n" +
         "`!brainrot on/off` (admin)\n" +
         "`!panel` (admin)\n" +
         "`!aistatus` (admin)\n" +
-        "`!aiclear` (admin)"
+        "`!aiclear` (admin)\n\n" +
+        "Tip: reply to Sparxo to continue the convo."
       );
     }
 
-    // Admin status/clear
-    if (message.content === "!aistatus") {
-      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
-      const left = Math.max(0, aiBlockedUntil - Date.now());
+    if (!isDM && message.content === "!aistatus") {
+      if (!isAdmin(message.member)) return message.reply("Admins only.");
+      const leftMs = Math.max(0, aiBlockedUntil - Date.now());
+      const leftSec = Math.ceil(leftMs / 1000);
       return message.reply(
-        `AI status:\n` +
-        `- blocked: ${left ? `${Math.ceil(left / 1000)}s left` : "NO"}\n` +
-        `- global busy: ${globalAiInFlight ? "YES" : "NO"}\n` +
-        `- listeners: ${client.listenerCount("messageCreate")}\n` +
-        `- OPENAI_KEY hash: ${safeKeyHash(ENV.OPENAI_KEY)}`
+        "AI status:\n" +
+        `• blocked: ${leftMs ? `${leftSec}s left` : "NO"}\n` +
+        `• global busy: ${globalAiBusy ? "YES" : "NO"}\n` +
+        `• listeners: ${client.listenerCount("messageCreate")}\n` +
+        `• OPENAI_KEY hash: ${safeKeyHash(ENV.OPENAI_KEY)}`
       );
     }
 
-    if (message.content === "!aiclear") {
-      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
+    if (!isDM && message.content === "!aiclear") {
+      if (!isAdmin(message.member)) return message.reply("Admins only.");
       aiBlockedUntil = 0;
-      globalAiInFlight = false;
+      globalAiBusy = false;
       return message.reply("✅ Cleared AI cooldown/busy state.");
     }
 
-    // Admin toggles
-    if (message.content.startsWith("!aiclean")) {
-      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
+    if (!isDM && message.content.startsWith("!aiclean")) {
+      if (!isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
       if (arg === "on") { aiCleanEnabled = true; return message.reply("✅ AI cleaning ON"); }
       if (arg === "off") { aiCleanEnabled = false; return message.reply("🛑 AI cleaning OFF"); }
       return message.reply("Use `!aiclean on` or `!aiclean off`");
     }
 
-    if (message.content.startsWith("!brainrot")) {
-      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
+    if (!isDM && message.content.startsWith("!brainrot")) {
+      if (!isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
       if (arg === "on") { brainrotEnabled = true; await startBrainrot(); return message.reply("✅ Brainrot ON"); }
       if (arg === "off") { brainrotEnabled = false; await startBrainrot(); return message.reply("🛑 Brainrot OFF"); }
       return message.reply("Use `!brainrot on` or `!brainrot off`");
     }
 
-    if (message.content === "!panel") {
-      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
+    if (!isDM && message.content === "!panel") {
+      if (!isAdmin(message.member)) return message.reply("Admins only.");
       if (!ENV.PANEL_CHANNEL_ID) return message.reply("PANEL_CHANNEL_ID not set.");
       await sendPanel(ENV.PANEL_CHANNEL_ID);
       return message.reply("✅ Panel sent.");
     }
 
-    // AI commands
+    /* =========================
+       AI trigger logic (NEW)
+       - DMs: any message triggers AI (unless it starts with "!")
+       - Threads named sparxo-*: any message triggers AI
+       - Reply-to-Sparxo: triggers AI
+       - Commands !ai / !aiw work anywhere
+    ========================= */
     const isAiw = message.content.startsWith("!aiw ");
     const isAi = message.content.startsWith("!ai ");
-    if (!isAiw && !isAi) return;
+    const inThread = isSparxoThread(message.channel);
 
-    // Circuit breaker check + show remaining time
+    const isReplyToBot =
+      message.reference?.messageId &&
+      botReplyToLocation.has(message.reference.messageId);
+
+    const shouldRunAI =
+      isAiw || isAi ||
+      (isDM && !message.content.startsWith("!")) ||
+      inThread ||
+      isReplyToBot;
+
+    if (!shouldRunAI) return;
+
+    // Circuit breaker
     if (Date.now() < aiBlockedUntil) {
-      const leftMs = aiBlockedUntil - Date.now();
-      const leftSec = Math.max(1, Math.ceil(leftMs / 1000));
-      return message.reply(`😴 Sparxo is cooling down (OpenAI). Try again in ${leftSec}s.`);
+      const leftSec = Math.max(1, Math.ceil((aiBlockedUntil - Date.now()) / 1000));
+      return message.reply(`Cooling down. Try again in ${leftSec}s.`);
     }
 
-    // prevent double handling
-    if (handled.has(message.id)) return;
+    // Dedupe
+    if (handledMessageIds.has(message.id)) return;
     markHandled(message.id);
 
-    // user cooldown
-    if (onCooldown(message.author.id)) {
-      return message.reply("⏳ Chill 😭 try again in a few seconds.");
+    // Per-user cooldown
+    if (isOnCooldown(message.author.id)) {
+      return message.reply("Try again in a few seconds.");
     }
 
-    const prompt = message.content.slice(isAiw ? 4 : 3).trim();
-    if (!prompt) return message.reply("Use `!ai your question` (or `!aiw` to force web).");
+    // Locks
+    if (inFlightByMessage.has(message.id)) return;
+    inFlightByMessage.add(message.id);
 
-    // ensure 1 AI request per message
-    if (inFlight.has(message.id)) return;
-    inFlight.add(message.id);
-
-    // ensure 1 AI request globally
-    if (globalAiInFlight) {
-      inFlight.delete(message.id);
-      return message.reply("⏳ One sec — I'm busy. Try again shortly.");
+    if (globalAiBusy) {
+      inFlightByMessage.delete(message.id);
+      return message.reply("Busy. Try again shortly.");
     }
-    globalAiInFlight = true;
+    globalAiBusy = true;
 
-    await message.channel.sendTyping().catch(() => {});
+    // Determine prompt
+    let prompt = "";
+    if (isAiw) prompt = message.content.slice(4).trim();
+    else if (isAi) prompt = message.content.slice(3).trim();
+    else prompt = message.content.trim();
 
-    // images
+    if (!prompt) {
+      globalAiBusy = false;
+      inFlightByMessage.delete(message.id);
+      return message.reply("Send a message with your question.");
+    }
+
+    // Determine conversation location (memory + “private session”)
+    // - DM: location is the DM channel id
+    // - Sparxo thread: location is thread id
+    // - Reply-to-bot: use stored location
+    // - Otherwise: location is the current channel id
+    let locationId = message.channel.id;
+
+    if (isReplyToBot) {
+      const info = botReplyToLocation.get(message.reference.messageId);
+      if (info?.locationId) locationId = info.locationId;
+    }
+
+    // If they used !ai/!aiw in the AI channel, move convo into a thread
+    let targetMessageForReply = message;
+    if (!isDM && (isAi || isAiw) && ENV.AI_CHANNEL_ID && message.channel.id === ENV.AI_CHANNEL_ID) {
+      const thread = await getOrCreateUserThread(message).catch(() => null);
+      if (thread) {
+        locationId = thread.id;
+        // send a clean note once and then continue in thread
+        await thread.send(`Hi ${message.author}, ask here anytime.`);
+        // also reply in original channel with thread link
+        await message.reply(`I made your thread: <#${thread.id}>`);
+        // from here, answer in thread by faking a "message-like" reply target:
+        targetMessageForReply = {
+          reply: (payload) => thread.send(payload),
+          channel: thread,
+        };
+      }
+    }
+
+    // Images (only if present)
     const imageUrls = [];
     for (const att of message.attachments.values()) {
       const ct = att.contentType || "";
       if (ct.startsWith("image/")) imageUrls.push(att.url);
     }
 
-    console.log("[OPENAI] calling", {
-      messageId: message.id,
-      userId: message.author.id,
-      channelId: message.channel.id,
-      forceWeb: isAiw,
-      keyHash: safeKeyHash(ENV.OPENAI_KEY),
-    });
+    await message.channel.sendTyping().catch(() => {});
+
+    // Memory turns for this user+location
+    const memTurns = getMemory(message.author.id, locationId);
 
     let out;
     try {
-      out = await runAI({ prompt, imageUrls, forceWeb: isAiw });
+      // store user turn
+      pushMemory(message.author.id, locationId, "user", prompt);
+
+      out = await runAI({
+        prompt,
+        imageUrls,
+        forceWeb: isAiw,
+        memoryTurns: memTurns,
+      });
+
+      // store assistant turn
+      pushMemory(message.author.id, locationId, "assistant", out);
+
     } catch (err) {
       const status = err?.status ?? err?.response?.status;
       const code = String(err?.code || err?.error?.code || "");
@@ -503,61 +658,60 @@ client.on("messageCreate", async (message) => {
       const msgLower = msg.toLowerCase();
       const headers = err?.headers || err?.response?.headers || {};
 
-      console.error("[OPENAI ERROR]", {
-        status,
-        code,
-        message: msg,
-        retryAfter: headers["retry-after"],
-      });
+      console.error("[OPENAI ERROR]", { status, code, message: msg, retryAfter: headers["retry-after"] });
 
-      // Billing/quota errors (cooldown won't help)
       if (status === 429 && (code.includes("insufficient_quota") || msgLower.includes("quota"))) {
-        aiBlockedUntil = 0;
-        return message.reply("💳 OpenAI quota/billing issue. Admin needs to check OpenAI Billing/Usage.");
+        return message.reply("OpenAI billing/quota issue.");
       }
 
-      // Rate limit: use Retry-After header if available, else parse message, else 3 minutes
       if (status === 429 && (code.includes("rate_limit") || msgLower.includes("rate limit"))) {
-        let waitMs = 3 * 60 * 1000;
-
+        let waitMs = 180 * 1000;
         const ra = Number(headers["retry-after"]);
         if (Number.isFinite(ra) && ra > 0) waitMs = ra * 1000;
-
         const parsed = parseRetryAfterMs(msgLower);
         if (parsed) waitMs = parsed;
 
-        aiBlockedUntil = Date.now() + waitMs;
-        const waitSec = Math.ceil(waitMs / 1000);
+        const newUntil = Date.now() + waitMs;
+        aiBlockedUntil = Math.max(aiBlockedUntil, newUntil);
 
-        console.error("[AI BLOCK] blocking until:", new Date(aiBlockedUntil).toISOString());
-        return message.reply(`😭 OpenAI rate limit — cooling down for ${waitSec}s.`);
+        return message.reply(`Rate limited. Try again in ${Math.ceil(waitMs / 1000)}s.`);
       }
 
       if (status === 401 || msgLower.includes("invalid api key")) {
-        return message.reply("❌ AI key error (admin needs to fix OPENAI_KEY in Render).");
+        return message.reply("Invalid OpenAI key.");
       }
 
-      return message.reply("❌ AI error. Try again soon.");
+      return message.reply("AI error. Try again soon.");
     } finally {
-      globalAiInFlight = false;
-      inFlight.delete(message.id);
+      globalAiBusy = false;
+      inFlightByMessage.delete(message.id);
     }
 
-    const sent = await replyChunks(message, out);
+    // Clean embed reply
+    const sent = await replyClean(
+      // if thread routing happened, use that target “message”
+      targetMessageForReply,
+      out,
+      message.author.id,
+      locationId
+    );
 
-    setTimeout(async () => {
-      for (const m of sent) await m.delete().catch(() => {});
-      await message.delete().catch(() => {});
-    }, DELETE_AFTER_MS);
+    // Optional auto-delete (keeps your original behavior; DMs usually should not auto-delete)
+    if (!isDM) {
+      setTimeout(async () => {
+        for (const m of sent) await m.delete().catch(() => {});
+        await message.delete().catch(() => {});
+      }, SETTINGS.DELETE_AFTER_MS);
+    }
 
   } catch (e) {
     console.error("messageCreate error:", e);
-    try { await message.reply("❌ Error. Check logs."); } catch {}
+    try { await message.reply("Error. Check logs."); } catch {}
   }
 });
 
 /* =========================
-   Panel interactions
+   Interactions (Panel)
 ========================= */
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
@@ -566,8 +720,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const details = new TextInputBuilder()
         .setCustomId(IDS.FIELD_DETAILS)
-        // Discord limit: label <= 45 chars
-        .setLabel("What do you need help with? (no pw)")
+        // label must be <= 45 chars
+        .setLabel("Your sparx password and mail")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -591,7 +745,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
       return await interaction.reply({
-        content: "✅ Got it. Pick a subject:",
+        content: "Pick a subject:",
         components: [new ActionRowBuilder().addComponents(subject)],
         ephemeral: true,
       });
@@ -613,7 +767,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
       return interaction.update({
-        content: `✅ Subject: **${s.subject}**\nNow pick request type:`,
+        content: `Subject: **${s.subject}**\nPick request type:`,
         components: [new ActionRowBuilder().addComponents(type)],
       });
     }
@@ -626,10 +780,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const admin = await client.channels.fetch(ENV.ADMIN_CHANNEL_ID).catch(() => null);
       if (!admin) {
-        return interaction.update({
-          content: "❌ Admin channel not found. Check ADMIN_CHANNEL_ID.",
-          components: [],
-        });
+        return interaction.update({ content: "Admin channel not found.", components: [] });
       }
 
       const embed = new EmbedBuilder()
@@ -646,20 +797,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await admin.send({ embeds: [embed] });
       sessions.delete(interaction.user.id);
 
-      return interaction.update({ content: "✅ Sent to admins. Thanks!", components: [] });
+      return interaction.update({ content: "Sent to admins. Thanks!", components: [] });
     }
   } catch (e) {
     console.error("interaction error:", e);
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: "❌ Error. Try again.", ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: "Error. Try again.", ephemeral: true }).catch(() => {});
     }
   }
+});
+
+/* =========================
+   Brainrot start + panel on ready
+========================= */
+client.once("ready", async () => {
+  if (ENV.PANEL_CHANNEL_ID) await sendPanel(ENV.PANEL_CHANNEL_ID);
+  await startBrainrot();
 });
 
 /* =========================
    Login
 ========================= */
 client.login(ENV.DISCORD_TOKEN);
+
 
 
 
