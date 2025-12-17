@@ -17,6 +17,7 @@ http
 ========================= */
 const axios = require("axios");
 const OpenAI = require("openai");
+const crypto = require("crypto");
 const {
   Client,
   GatewayIntentBits,
@@ -62,7 +63,7 @@ if (!ENV.ADMIN_CHANNEL_ID) console.error("❌ Missing ADMIN_CHANNEL_ID");
 const DELETE_AFTER_MS = Math.max(10, ENV.DELETE_AFTER_SECONDS) * 1000;
 const COOLDOWN_MS = Math.max(1, ENV.AI_COOLDOWN_SECONDS) * 1000;
 const MAX_IMAGES = 2;
-const MAX_TOKENS = 450; // keep short-ish
+const MAX_TOKENS = 450;
 
 /* =========================
    Discord client + OpenAI
@@ -78,10 +79,32 @@ const client = new Client({
 const openai = new OpenAI({ apiKey: ENV.OPENAI_KEY });
 
 /* =========================
-   RATE-LIMIT CIRCUIT BREAKER
-   Only trip it on real OpenAI 429 / rate_limit code
+   Circuit breaker + locks
 ========================= */
 let aiBlockedUntil = 0;
+
+// global mutex (stops bursts / parallel calls)
+let globalAiInFlight = false;
+
+// per-message in-flight lock
+const inFlight = new Set();
+
+// message dedupe (prevents double handling)
+const handled = new Set();
+function markHandled(id) {
+  handled.add(id);
+  setTimeout(() => handled.delete(id), 5 * 60 * 1000);
+}
+
+// per-user cooldown
+const lastUse = new Map();
+function onCooldown(userId) {
+  const now = Date.now();
+  const prev = lastUse.get(userId) || 0;
+  if (now - prev < COOLDOWN_MS) return true;
+  lastUse.set(userId, now);
+  return false;
+}
 
 /* =========================
    Helpers
@@ -118,59 +141,44 @@ function isAdmin(member) {
 function isEducationRelated(text) {
   const t = (text || "").toLowerCase();
   const words = [
-    "math",
-    "algebra",
-    "geometry",
-    "trig",
-    "calculus",
-    "equation",
-    "simplify",
-    "factor",
-    "science",
-    "physics",
-    "chemistry",
-    "biology",
-    "english",
-    "essay",
-    "grammar",
-    "literature",
-    "history",
-    "geography",
-    "homework",
-    "revision",
-    "exam",
-    "test",
-    "worksheet",
-    "question",
-    "solve",
-    "prove",
-    "derive",
-    "calculate",
-    "evaluate",
+    "math","algebra","geometry","trig","calculus","equation","simplify","factor",
+    "science","physics","chemistry","biology",
+    "english","essay","grammar","literature",
+    "history","geography",
+    "homework","revision","exam","test","worksheet","question",
+    "solve","prove","derive","calculate","evaluate",
   ];
-  return words.some((w) => t.includes(w));
+  return words.some(w => t.includes(w));
 }
 
 function needsWeb(text) {
   const t = (text || "").toLowerCase();
   const triggers = [
-    "latest",
-    "today",
-    "current",
-    "news",
-    "update",
-    "updated",
-    "release",
-    "version",
-    "price",
-    "cost",
-    "in stock",
-    "availability",
-    "2024",
-    "2025",
-    "2026",
+    "latest","today","current","news","update","updated","release","version",
+    "price","cost","in stock","availability",
+    "2024","2025","2026",
   ];
-  return triggers.some((w) => t.includes(w));
+  return triggers.some(w => t.includes(w));
+}
+
+function parseRetryAfterMs(msgLower) {
+  const m = msgLower.match(/try again in\s+(\d+)m(\d+)s/i);
+  if (m) {
+    const mins = Number(m[1]);
+    const secs = Number(m[2]);
+    if (Number.isFinite(mins) && Number.isFinite(secs)) return (mins * 60 + secs) * 1000;
+  }
+  const s = msgLower.match(/try again in\s+(\d+)s/i);
+  if (s) {
+    const secs = Number(s[1]);
+    if (Number.isFinite(secs)) return secs * 1000;
+  }
+  return null;
+}
+
+function safeKeyHash(key) {
+  if (!key) return "missing";
+  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 12);
 }
 
 /* =========================
@@ -183,7 +191,7 @@ async function webSearch(query) {
     timeout: 15000,
   });
 
-  return (data.organic_results || []).slice(0, 4).map((r) => ({
+  return (data.organic_results || []).slice(0, 4).map(r => ({
     title: r.title,
     link: r.link,
     snippet: String(r.snippet || "").slice(0, 180),
@@ -203,28 +211,10 @@ function allowedInAiChannel(content) {
     c.startsWith("!aiclean ") ||
     c.startsWith("!brainrot ") ||
     c === "!panel" ||
-    c === "!help"
+    c === "!help" ||
+    c === "!aistatus" ||
+    c === "!aiclear"
   );
-}
-
-/* =========================
-   Anti-double reply + cooldown + in-flight lock
-========================= */
-const handled = new Set();
-function markHandled(id) {
-  handled.add(id);
-  setTimeout(() => handled.delete(id), 5 * 60 * 1000);
-}
-
-const inFlight = new Set(); // ensures 1 AI request per message
-
-const lastUse = new Map();
-function onCooldown(userId) {
-  const now = Date.now();
-  const prev = lastUse.get(userId) || 0;
-  if (now - prev < COOLDOWN_MS) return true;
-  lastUse.set(userId, now);
-  return false;
 }
 
 /* =========================
@@ -288,13 +278,13 @@ async function sendPanel(channelId) {
   if (!channel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle("Sparxo Sparx Helper")
+    .setTitle("Sparxo Helper Panel")
     .setDescription("Click below to request help.\n**Do NOT share passwords or private info.**");
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(IDS.BTN_START)
-      .setLabel("Start Homework request")
+      .setLabel("Start request")
       .setStyle(ButtonStyle.Primary)
   );
 
@@ -306,16 +296,16 @@ async function sendPanel(channelId) {
 ========================= */
 function systemPrompt(isTutor) {
   return (
-    `You are "Sparxo", a chill, nerdy, funny helper for teens.
+`You are "Sparxo", a chill, nerdy, funny helper for teens.
 
 Academic integrity:
-- Do NOT help users cheat or "complete" graded tasks for them.
+- Do NOT help users cheat or complete graded tasks.
 - Teach the method, give hints, explain steps, and help them learn.
 
 Style:
-- If maths/science/education: step-by-step and explain why.
-- Otherwise: chill, casual, but still helpful.
-- Keep it not too long unless the user asks for detail.`
+- If education: step-by-step and explain why.
+- Otherwise: chill + helpful.
+- Keep it not too long unless asked.`
     + (isTutor ? "\nTutor mode: step-by-step." : "\nChill mode.")
   );
 }
@@ -369,6 +359,7 @@ client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log("messageCreate listeners:", client.listenerCount("messageCreate"));
   console.log("process pid:", process.pid);
+  console.log("OPENAI_KEY hash:", safeKeyHash(ENV.OPENAI_KEY));
 
   if (ENV.PANEL_CHANNEL_ID) await sendPanel(ENV.PANEL_CHANNEL_ID);
   await startBrainrot();
@@ -379,7 +370,7 @@ client.once("ready", async () => {
 ========================= */
 client.on("messageCreate", async (message) => {
   try {
-    // Ignore DMs, bots, and webhooks (prevents phantom loops)
+    // Prevent phantom triggers / loops
     if (!message.guild) return;
     if (!message.author) return;
     if (message.author.bot) return;
@@ -396,42 +387,50 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!help") {
       return message.reply(
         "Commands:\n" +
-          "`!ai <question>` (normal)\n" +
-          "`!aiw <question>` (force web search)\n" +
-          "`!aiclean on/off` (admin)\n" +
-          "`!brainrot on/off` (admin)\n" +
-          "`!panel` (admin) reposts the panel"
+        "`!ai <question>` (normal)\n" +
+        "`!aiw <question>` (force web search)\n" +
+        "`!aiclean on/off` (admin)\n" +
+        "`!brainrot on/off` (admin)\n" +
+        "`!panel` (admin)\n" +
+        "`!aistatus` (admin)\n" +
+        "`!aiclear` (admin)"
       );
+    }
+
+    // Admin status/clear
+    if (message.content === "!aistatus") {
+      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
+      const left = Math.max(0, aiBlockedUntil - Date.now());
+      return message.reply(
+        `AI status:\n` +
+        `- blocked: ${left ? `${Math.ceil(left / 1000)}s left` : "NO"}\n` +
+        `- global busy: ${globalAiInFlight ? "YES" : "NO"}\n` +
+        `- listeners: ${client.listenerCount("messageCreate")}\n` +
+        `- OPENAI_KEY hash: ${safeKeyHash(ENV.OPENAI_KEY)}`
+      );
+    }
+
+    if (message.content === "!aiclear") {
+      if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
+      aiBlockedUntil = 0;
+      globalAiInFlight = false;
+      return message.reply("✅ Cleared AI cooldown/busy state.");
     }
 
     // Admin toggles
     if (message.content.startsWith("!aiclean")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
-      if (arg === "on") {
-        aiCleanEnabled = true;
-        return message.reply("✅ AI cleaning ON");
-      }
-      if (arg === "off") {
-        aiCleanEnabled = false;
-        return message.reply("🛑 AI cleaning OFF");
-      }
+      if (arg === "on") { aiCleanEnabled = true; return message.reply("✅ AI cleaning ON"); }
+      if (arg === "off") { aiCleanEnabled = false; return message.reply("🛑 AI cleaning OFF"); }
       return message.reply("Use `!aiclean on` or `!aiclean off`");
     }
 
     if (message.content.startsWith("!brainrot")) {
       if (!message.guild || !isAdmin(message.member)) return message.reply("Admins only.");
       const arg = message.content.split(/\s+/)[1]?.toLowerCase();
-      if (arg === "on") {
-        brainrotEnabled = true;
-        await startBrainrot();
-        return message.reply("✅ Brainrot ON");
-      }
-      if (arg === "off") {
-        brainrotEnabled = false;
-        await startBrainrot();
-        return message.reply("🛑 Brainrot OFF");
-      }
+      if (arg === "on") { brainrotEnabled = true; await startBrainrot(); return message.reply("✅ Brainrot ON"); }
+      if (arg === "off") { brainrotEnabled = false; await startBrainrot(); return message.reply("🛑 Brainrot OFF"); }
       return message.reply("Use `!brainrot on` or `!brainrot off`");
     }
 
@@ -450,15 +449,15 @@ client.on("messageCreate", async (message) => {
     // Circuit breaker check + show remaining time
     if (Date.now() < aiBlockedUntil) {
       const leftMs = aiBlockedUntil - Date.now();
-      const leftSec = Math.ceil(leftMs / 1000);
-      return message.reply(`😴 Sparxo is cooling down (rate limit). Try again in ${leftSec}s.`);
+      const leftSec = Math.max(1, Math.ceil(leftMs / 1000));
+      return message.reply(`😴 Sparxo is cooling down (OpenAI). Try again in ${leftSec}s.`);
     }
 
     // prevent double handling
     if (handled.has(message.id)) return;
     markHandled(message.id);
 
-    // cooldown
+    // user cooldown
     if (onCooldown(message.author.id)) {
       return message.reply("⏳ Chill 😭 try again in a few seconds.");
     }
@@ -466,9 +465,16 @@ client.on("messageCreate", async (message) => {
     const prompt = message.content.slice(isAiw ? 4 : 3).trim();
     if (!prompt) return message.reply("Use `!ai your question` (or `!aiw` to force web).");
 
-    // ensure 1 AI request per message no matter what
+    // ensure 1 AI request per message
     if (inFlight.has(message.id)) return;
     inFlight.add(message.id);
+
+    // ensure 1 AI request globally
+    if (globalAiInFlight) {
+      inFlight.delete(message.id);
+      return message.reply("⏳ One sec — I'm busy. Try again shortly.");
+    }
+    globalAiInFlight = true;
 
     await message.channel.sendTyping().catch(() => {});
 
@@ -484,6 +490,7 @@ client.on("messageCreate", async (message) => {
       userId: message.author.id,
       channelId: message.channel.id,
       forceWeb: isAiw,
+      keyHash: safeKeyHash(ENV.OPENAI_KEY),
     });
 
     let out;
@@ -493,22 +500,46 @@ client.on("messageCreate", async (message) => {
       const status = err?.status ?? err?.response?.status;
       const code = String(err?.code || err?.error?.code || "");
       const msg = String(err?.message || "");
+      const msgLower = msg.toLowerCase();
+      const headers = err?.headers || err?.response?.headers || {};
 
-      console.error("[OPENAI ERROR]", { status, code, message: msg });
+      console.error("[OPENAI ERROR]", {
+        status,
+        code,
+        message: msg,
+        retryAfter: headers["retry-after"],
+      });
 
-      // ✅ only trip circuit breaker on real 429 / rate_limit code
-      if (status === 429 || code.includes("rate_limit")) {
-        aiBlockedUntil = Date.now() + 3 * 60 * 1000;
-        console.error("[AI BLOCK] OpenAI rate limit. Blocking until:", new Date(aiBlockedUntil).toISOString());
-        return message.reply("😭 OpenAI rate limit — cooling down for 3 minutes.");
+      // Billing/quota errors (cooldown won't help)
+      if (status === 429 && (code.includes("insufficient_quota") || msgLower.includes("quota"))) {
+        aiBlockedUntil = 0;
+        return message.reply("💳 OpenAI quota/billing issue. Admin needs to check OpenAI Billing/Usage.");
       }
 
-      if (status === 401 || msg.toLowerCase().includes("invalid api key")) {
+      // Rate limit: use Retry-After header if available, else parse message, else 3 minutes
+      if (status === 429 && (code.includes("rate_limit") || msgLower.includes("rate limit"))) {
+        let waitMs = 3 * 60 * 1000;
+
+        const ra = Number(headers["retry-after"]);
+        if (Number.isFinite(ra) && ra > 0) waitMs = ra * 1000;
+
+        const parsed = parseRetryAfterMs(msgLower);
+        if (parsed) waitMs = parsed;
+
+        aiBlockedUntil = Date.now() + waitMs;
+        const waitSec = Math.ceil(waitMs / 1000);
+
+        console.error("[AI BLOCK] blocking until:", new Date(aiBlockedUntil).toISOString());
+        return message.reply(`😭 OpenAI rate limit — cooling down for ${waitSec}s.`);
+      }
+
+      if (status === 401 || msgLower.includes("invalid api key")) {
         return message.reply("❌ AI key error (admin needs to fix OPENAI_KEY in Render).");
       }
 
       return message.reply("❌ AI error. Try again soon.");
     } finally {
+      globalAiInFlight = false;
       inFlight.delete(message.id);
     }
 
@@ -518,11 +549,10 @@ client.on("messageCreate", async (message) => {
       for (const m of sent) await m.delete().catch(() => {});
       await message.delete().catch(() => {});
     }, DELETE_AFTER_MS);
+
   } catch (e) {
     console.error("messageCreate error:", e);
-    try {
-      await message.reply("❌ Error. Check logs.");
-    } catch {}
+    try { await message.reply("❌ Error. Check logs."); } catch {}
   }
 });
 
@@ -536,7 +566,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const details = new TextInputBuilder()
         .setCustomId(IDS.FIELD_DETAILS)
-        .setLabel("Explain what you need help with (don’t share passwords)")
+        // Discord limit: label <= 45 chars
+        .setLabel("What do you need help with? (no pw)")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -602,7 +633,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       const embed = new EmbedBuilder()
-        .setTitle("New Sparxo Help Request")
+        .setTitle("New Help Request")
         .addFields(
           { name: "User", value: `${interaction.user.tag} (${interaction.user.id})` },
           { name: "Server", value: interaction.guild?.name ?? "Unknown" },
@@ -629,6 +660,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
    Login
 ========================= */
 client.login(ENV.DISCORD_TOKEN);
+
 
 
 
